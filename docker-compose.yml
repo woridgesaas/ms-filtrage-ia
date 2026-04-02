@@ -1,0 +1,43 @@
+﻿services:
+  woridge.ms-filtrage-ia:
+    container_name: woridge-ms-filtrage-ia
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Infra/Dockerfile
+    env_file:
+      - .env
+    environment:
+      ASPNETCORE_URLS: http://0.0.0.0:8080
+    ports:
+      - "${APP_PORT}:8080"
+    depends_on:
+      - sqlserver
+    networks:
+      - woridge-external-network
+    volumes:
+      - ms-filtrage-ia_logs:/app/logs
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: woridge-ms-filtrage-ia-db
+    restart: unless-stopped
+    environment:
+      SA_PASSWORD: ${MSSQL_PASSWORD} 
+      ACCEPT_EULA: "Y"
+    ports:
+      - "${SQL_PORT}:1433"
+    volumes:
+      - ms-filtrage-ia_db:/var/opt/mssql
+    networks:
+      - woridge-external-network
+
+networks:
+  woridge-external-network:
+    external: true
+
+volumes:
+  ms-filtrage-ia_logs:
+    name: ms-filtrage-ia_logs
+  ms-filtrage-ia_db:
+    name: ms-filtrage-ia_db
