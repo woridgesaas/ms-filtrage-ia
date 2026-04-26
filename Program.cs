@@ -1,31 +1,74 @@
 using Microsoft.EntityFrameworkCore;
+using Minio;
 using ms_filtering_ia.Data;
+using ms_filtering_ia.Messaging.Publisher;
+using ms_filtering_ia.Options;
+using ms_filtering_ia.Repositories;
+using ms_filtering_ia.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-
 builder.Services.AddControllers();
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+// ── Base de données ───────────────────────────────────────────────────────
+builder.Services.AddDbContext<AppDbContext>(opt =>
+    opt.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+// ── MinIO ─────────────────────────────────────────────────────────────────
+builder.Services.AddMinio(config => config
+    .WithEndpoint(builder.Configuration["Minio:Endpoint"])
+    .WithCredentials(
+        builder.Configuration["Minio:AccessKey"],
+        builder.Configuration["Minio:SecretKey"])
+    .WithSSL(false)
+    .Build());
+
+// ── Options ───────────────────────────────────────────────────────────────
+builder.Services.Configure<RabbitMQSettings>(
+    builder.Configuration.GetSection("RabbitMQ"));
+builder.Services.Configure<TesseractOptions>(
+    builder.Configuration.GetSection("Tesseract"));
+
+// ── Services ──────────────────────────────────────────────────────────────
+builder.Services.AddScoped<IMinioService,          MinioService>();
+builder.Services.AddScoped<IPdfExtractorService,   PdfExtractorService>();
+builder.Services.AddScoped<IOcrService,            OcrService>();
+builder.Services.AddScoped<IFilteringService,      FilteringService>();
+builder.Services.AddScoped<IFilteringProfileService, FilteringProfileService>();
+
+// ── Repositories ──────────────────────────────────────────────────────────
+builder.Services.AddScoped<IFilteringResultRepository,  FilteringResultRepository>();
+builder.Services.AddScoped<IFilteringProfileRepository, FilteringProfileRepository>();
+
+// ── RabbitMQ ──────────────────────────────────────────────────────────────
+builder.Services.AddSingleton<IRabbitMQConnection, RabbitMQConnection>();
+builder.Services.AddScoped<IRabbitMQPublisher,     RabbitMQPublisher>();
+
+// ── HttpClient Python API (timeout long : OCR + LLM) ─────────────────────
+builder.Services.AddHttpClient<IPythonApiService, PythonApiService>(client =>
+{
+    client.BaseAddress = new Uri(
+        builder.Configuration["PythonApi:BaseUrl"] ?? "http://localhost:8000");
+    client.Timeout = TimeSpan.FromSeconds(120);
+});
+
+// ── CORS ──────────────────────────────────────────────────────────────────
+builder.Services.AddCors(opt => opt.AddPolicy("AllowAngular", p =>
+    p.WithOrigins("http://localhost:4200")
+     .AllowAnyHeader()
+     .AllowAnyMethod()));
+
+builder.Services.AddHttpContextAccessor();
 
 var app = builder.Build();
 
-
-
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
-{
     app.MapOpenApi();
-}
 
 app.UseHttpsRedirection();
-
+app.UseCors("AllowAngular");
+app.UseMiddleware<ms_filtering_ia.Middleware.GatewayAuthMiddleware>();
 app.UseAuthorization();
-
 app.MapControllers();
-
 app.Run();
