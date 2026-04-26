@@ -9,43 +9,34 @@ namespace ms_filtering_ia.Controllers;
 public class FilteringController : ControllerBase
 {
     private readonly IFilteringService _filteringService;
-    private readonly IFilteringProfileService _filteringProfileService;
-    private readonly IMinioService _minioService;
+    private readonly IFilteringProfileService _profileService;
 
     public FilteringController(
-    IFilteringService filteringService,
-    IMinioService minioService,
-    IFilteringProfileService filteringProfileService)
+        IFilteringService filteringService,
+        IFilteringProfileService profileService)
     {
         _filteringService = filteringService;
-        _minioService = minioService;
-        _filteringProfileService = filteringProfileService;
+        _profileService = profileService;
     }
 
-    // ── NOUVEAU — appelé par Angular "Filtrer par IA" ──────────────────
     [HttpPost("analyze-all")]
-    public async Task<IActionResult> AnalyzeAll([FromBody] OfferForm offer)
-    {
-        var results = await _filteringService.AnalyzeAllCvsAsync(offer);
-        return Ok(results);
-    }
+    public async Task<IActionResult> AnalyzeAll([FromBody] AnalyzeCvsRequest request)
+        => Ok(await _filteringService.AnalyzeAllCvsAsync(request));
 
     [HttpGet("results")]
     public async Task<IActionResult> GetResults()
-    {
-        var results = await _filteringService.GetAllResultsAsync();
-        return Ok(results);
-    }
+        => Ok(await _filteringService.GetAllResultsAsync());
+
     [HttpGet("cv-url")]
     public async Task<IActionResult> GetCvUrl([FromQuery] string fileName)
     {
         if (string.IsNullOrWhiteSpace(fileName))
-            return BadRequest("fileName requis");
+            return BadRequest("fileName requis.");
 
-        var url = await _minioService.GetPresignedUrlAsync(fileName);
+        var url = await _filteringService.GetCvPresignedUrlAsync(fileName);
         return Ok(new { url });
     }
-    // Nouvel endpoint à ajouter
+
     [HttpPost("profiles")]
     public async Task<IActionResult> CreateProfile(
         [FromBody] CreateFilteringProfileRequest request)
@@ -59,9 +50,10 @@ public class FilteringController : ControllerBase
                 message = "UserCin manquant dans le contexte."
             });
 
-        var response = await _filteringProfileService.CreateProfileAsync(request, userCin);
+        var response = await _profileService.CreateProfileAsync(request, userCin);
         return CreatedAtAction(nameof(CreateProfile), new { id = response.Id }, response);
     }
+
     [HttpPatch("accept/{id}")]
     public async Task<IActionResult> AcceptCandidate(int id, [FromQuery] int offerId)
     {
@@ -77,10 +69,8 @@ public class FilteringController : ControllerBase
         var response = await _filteringService.AcceptCandidateAsync(id, offerId, userCin);
         return Ok(response);
     }
+
     [HttpPatch("reject/{id}")]
     public async Task<IActionResult> RejectCandidate(int id)
-    {
-        var response = await _filteringService.RejectCandidateAsync(id);
-        return Ok(response);
-    }
+        => Ok(await _filteringService.RejectCandidateAsync(id));
 }

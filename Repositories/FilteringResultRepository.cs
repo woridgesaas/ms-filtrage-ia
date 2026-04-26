@@ -1,3 +1,4 @@
+// Repositories/FilteringResultRepository.cs
 using Microsoft.EntityFrameworkCore;
 using ms_filtering_ia.Data;
 using ms_filtering_ia.Models;
@@ -13,16 +14,15 @@ public sealed class FilteringResultRepository : IFilteringResultRepository
     public async Task AddAsync(FilteringResult result)
         => await _db.FilteringResults.AddAsync(result);
 
+    public async Task AddRangeAsync(IEnumerable<FilteringResult> results)
+        => await _db.FilteringResults.AddRangeAsync(results);
+
     public async Task<List<FilteringResult>> GetAllAsync()
         => await _db.FilteringResults.ToListAsync();
 
     public async Task<FilteringResult?> GetByIdAsync(int id)
         => await _db.FilteringResults.FirstOrDefaultAsync(r => r.Id == id);
 
-    /// <summary>
-    /// Retourne les chemins MinIO de tous les CVs dont un candidat a été accepté.
-    /// Utilisé pour les exclure du prochain filtrage.
-    /// </summary>
     public async Task<HashSet<string>> GetAcceptedCvPathsAsync()
     {
         var paths = await _db.FilteringResults

@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Minio;
 using ms_filtering_ia.Data;
 using ms_filtering_ia.Messaging.Publisher;
+using ms_filtering_ia.Middleware;
 using ms_filtering_ia.Options;
 using ms_filtering_ia.Repositories;
 using ms_filtering_ia.Services;
@@ -30,12 +31,15 @@ builder.Services.Configure<RabbitMQSettings>(
 builder.Services.Configure<TesseractOptions>(
     builder.Configuration.GetSection("Tesseract"));
 
-// ── Services ──────────────────────────────────────────────────────────────
+// ── Infrastructure ────────────────────────────────────────────────────────
 builder.Services.AddScoped<IMinioService,          MinioService>();
 builder.Services.AddScoped<IPdfExtractorService,   PdfExtractorService>();
-builder.Services.AddScoped<IOcrService,            OcrService>();
-builder.Services.AddScoped<IFilteringService,      FilteringService>();
-builder.Services.AddScoped<IFilteringProfileService, FilteringProfileService>();
+builder.Services.AddScoped<IOcrService,            OcrService>();         // Scoped — TesseractEngine non thread-safe
+
+// ── Domain services ───────────────────────────────────────────────────────
+builder.Services.AddScoped<ICvTextExtractorService,    CvTextExtractorService>();
+builder.Services.AddScoped<IFilteringService,          FilteringService>();
+builder.Services.AddScoped<IFilteringProfileService,   FilteringProfileService>();
 
 // ── Repositories ──────────────────────────────────────────────────────────
 builder.Services.AddScoped<IFilteringResultRepository,  FilteringResultRepository>();
@@ -45,12 +49,14 @@ builder.Services.AddScoped<IFilteringProfileRepository, FilteringProfileReposito
 builder.Services.AddSingleton<IRabbitMQConnection, RabbitMQConnection>();
 builder.Services.AddScoped<IRabbitMQPublisher,     RabbitMQPublisher>();
 
-// ── HttpClient Python API (timeout long : OCR + LLM) ─────────────────────
+// ── HttpClient Python API ─────────────────────────────────────────────────
+// Timeout long : pipeline OCR + LLM peut dépasser 60s sur gros volumes
 builder.Services.AddHttpClient<IPythonApiService, PythonApiService>(client =>
 {
     client.BaseAddress = new Uri(
         builder.Configuration["PythonApi:BaseUrl"] ?? "http://localhost:8000");
-    client.Timeout = TimeSpan.FromSeconds(120);
+    client.Timeout = TimeSpan.FromSeconds(
+        builder.Configuration.GetValue<int>("PythonApi:TimeoutSeconds", 1200));
 });
 
 // ── CORS ──────────────────────────────────────────────────────────────────
@@ -68,7 +74,11 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 app.UseCors("AllowAngular");
-app.UseMiddleware<ms_filtering_ia.Middleware.GatewayAuthMiddleware>();
+
+// ── Middlewares (ordre important) ─────────────────────────────────────────
+app.UseMiddleware<GlobalExceptionMiddleware>();   // 1 — capture toutes les exceptions
+app.UseMiddleware<GatewayAuthMiddleware>();       // 2 — vérifie secret + rôle HR
+
 app.UseAuthorization();
 app.MapControllers();
 app.Run();

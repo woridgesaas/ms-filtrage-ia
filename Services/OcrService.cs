@@ -1,3 +1,4 @@
+// Services/OcrService.cs
 using System.Text;
 using Microsoft.Extensions.Options;
 using ms_filtering_ia.Options;
@@ -6,23 +7,27 @@ using UglyToad.PdfPig;
 
 namespace ms_filtering_ia.Services;
 
-public sealed class OcrService : IOcrService
+public sealed class OcrService : IOcrService, IDisposable
 {
-    private readonly TesseractOptions    _options;
+    private readonly TesseractOptions _options;
     private readonly ILogger<OcrService> _logger;
+    private TesseractEngine? _engine;    // ← nullable, non initialisé
+    private bool _disposed;
 
     public OcrService(IOptions<TesseractOptions> options, ILogger<OcrService> logger)
     {
         _options = options.Value;
-        _logger  = logger;
+        _logger = logger;
     }
+
+    // Lazy : créé une seule fois par scope, au premier appel OCR réel
+    private TesseractEngine Engine =>
+        _engine ??= new TesseractEngine(_options.DataPath, _options.Languages, EngineMode.Default);
 
     public string ExtractTextFromImages(Stream pdfStream)
     {
         var sb = new StringBuilder();
-
-        using var engine = new TesseractEngine(_options.DataPath, _options.Languages, EngineMode.Default);
-        using var pdf    = PdfDocument.Open(pdfStream);
+        using var pdf = PdfDocument.Open(pdfStream);
 
         foreach (var page in pdf.GetPages())
         {
@@ -44,8 +49,8 @@ public sealed class OcrService : IOcrService
                         continue;
                     }
 
-                    using var pix     = Pix.LoadFromMemory(pngBytes.ToArray());
-                    using var ocrPage = engine.Process(pix);
+                    using var pix = Pix.LoadFromMemory(pngBytes.ToArray());
+                    using var ocrPage = Engine.Process(pix);  // ← propriété lazy, majuscule
                     var text = ocrPage.GetText();
 
                     if (!string.IsNullOrWhiteSpace(text))
@@ -61,5 +66,12 @@ public sealed class OcrService : IOcrService
         var result = sb.ToString().Trim();
         _logger.LogInformation("[OcrService] OCR terminé : {Length} chars.", result.Length);
         return result;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _engine?.Dispose();   // ← safe si jamais instancié (null-conditional)
+        _disposed = true;
     }
 }

@@ -24,20 +24,7 @@ public sealed class PythonApiService : IPythonApiService
     public async Task<IndexResponse> IndexAsync(IndexRequest request)
     {
         _logger.LogInformation("[/index] {Filename}", request.Metadata.Filename);
-
-        var response = await _httpClient.PostAsJsonAsync("/api/v1/index", request, JsonOptions);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var err = await response.Content.ReadAsStringAsync();
-            _logger.LogError("[/index] {Status} — {Body}", (int)response.StatusCode, err);
-        }
-
-        response.EnsureSuccessStatusCode();
-
-        var result = await response.Content.ReadFromJsonAsync<IndexResponse>(JsonOptions)
-                     ?? throw new InvalidOperationException("/index a retourné null");
-
+        var result = await PostAsync<IndexResponse>("/api/v1/index", request, "/index");
         _logger.LogInformation("[/index] cv_id={CvId} | status={Status}",
             result.CvId, result.Status);
         return result;
@@ -46,30 +33,16 @@ public sealed class PythonApiService : IPythonApiService
     public async Task<ExtractionResponse> ExtractAsync(string cvId, string cvText)
     {
         _logger.LogInformation("[/extract] cv_id={CvId}", cvId);
-
-        var response = await _httpClient.PostAsJsonAsync(
+        var result = await PostAsync<ExtractionResponse>(
             "/api/v1/extract",
             new { cv_id = cvId, cv_text = cvText },
-            JsonOptions);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var err = await response.Content.ReadAsStringAsync();
-            _logger.LogError("[/extract] {Status} — {Body}", (int)response.StatusCode, err);
-        }
-
-        response.EnsureSuccessStatusCode();
-
-        var result = await response.Content.ReadFromJsonAsync<ExtractionResponse>(JsonOptions)
-                     ?? throw new InvalidOperationException("/extract a retourné null");
-
+            "/extract");
         _logger.LogInformation(
             "[/extract] {Skills} skills | {Exp} ans | {Seniority} | {Domain}",
             result.Data.TechnicalSkills.Count + result.Data.Tools.Count,
             result.Data.TotalExperienceYears,
             result.Data.SeniorityLevel,
             result.Data.MainDomain);
-
         return result;
     }
 
@@ -77,21 +50,27 @@ public sealed class PythonApiService : IPythonApiService
     {
         _logger.LogInformation("[/match] offre={Title} | top_k={TopK}",
             request.JobOffer.JobTitle, request.TopK);
+        var result = await PostAsync<MatchingResponse>("/api/v1/match", request, "/match");
+        _logger.LogInformation("[/match] {Count} candidats scorés.", result.Candidates.Count);
+        return result;
+    }
 
-        var response = await _httpClient.PostAsJsonAsync("/api/v1/match", request, JsonOptions);
+    // ── Helper commun — élimine la duplication log+ensure+deserialize ─────
+    private async Task<TResponse> PostAsync<TResponse>(
+        string endpoint, object payload, string logLabel)
+    {
+        var response = await _httpClient.PostAsJsonAsync(endpoint, payload, JsonOptions);
 
         if (!response.IsSuccessStatusCode)
         {
             var err = await response.Content.ReadAsStringAsync();
-            _logger.LogError("[/match] {Status} — {Body}", (int)response.StatusCode, err);
+            _logger.LogError("[{Label}] {Status} — {Body}",
+                logLabel, (int)response.StatusCode, err);
         }
 
         response.EnsureSuccessStatusCode();
 
-        var result = await response.Content.ReadFromJsonAsync<MatchingResponse>(JsonOptions)
-                     ?? throw new InvalidOperationException("/match a retourné null");
-
-        _logger.LogInformation("[/match] {Count} candidats scorés.", result.Candidates.Count);
-        return result;
+        return await response.Content.ReadFromJsonAsync<TResponse>(JsonOptions)
+               ?? throw new InvalidOperationException($"{endpoint} a retourné null");
     }
 }

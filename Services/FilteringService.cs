@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using ms_filtering_ia.DTOs;
 using ms_filtering_ia.Mappers;
 using ms_filtering_ia.Messaging.Events;
@@ -9,41 +10,38 @@ namespace ms_filtering_ia.Services;
 
 public sealed class FilteringService : IFilteringService
 {
-    private readonly IMinioService _minio;
-    private readonly IPdfExtractorService _pdfExtractor;
-    private readonly IOcrService _ocr;
+    private readonly ICvTextExtractorService _cvExtractor;
     private readonly IPythonApiService _pythonApi;
+    private readonly IMinioService _minio;
     private readonly IFilteringResultRepository _repository;
     private readonly IRabbitMQPublisher _publisher;
     private readonly ILogger<FilteringService> _logger;
 
-    private const int MinTextLength = 50;
+    // Limite les appels concurrents vers Python/Ollama
+    private const int MaxParallelPythonCalls = 1;
 
     public FilteringService(
-        IMinioService minio,
-        IPdfExtractorService pdfExtractor,
-        IOcrService ocr,
+        ICvTextExtractorService cvExtractor,
         IPythonApiService pythonApi,
+        IMinioService minio,
         IFilteringResultRepository repository,
         IRabbitMQPublisher publisher,
         ILogger<FilteringService> logger)
     {
-        _minio = minio;
-        _pdfExtractor = pdfExtractor;
-        _ocr = ocr;
+        _cvExtractor = cvExtractor;
         _pythonApi = pythonApi;
+        _minio = minio;
         _repository = repository;
         _publisher = publisher;
         _logger = logger;
     }
 
     // ── Pipeline "Filtrer par IA" ─────────────────────────────────────────
-    // Étapes :
-    //   1. Index + Extract pour chaque CV MinIO
-    //   2. Un seul appel /match avec le job_offer → Python score tous les CVs
-    //   3. On croise les résultats pour sauvegarder en DB
+    // Phase 1 : extraction texte séquentielle (OCR non thread-safe)
+    // Phase 2 : index + extract en parallèle (goulot Python/Ollama)
+    // Phase 3 : match global → croisement → sauvegarde batch
     // ─────────────────────────────────────────────────────────────────────
-    public async Task<List<FilteringResultResponse>> AnalyzeAllCvsAsync(OfferForm offer)
+    public async Task<List<FilteringResultResponse>> AnalyzeAllCvsAsync(AnalyzeCvsRequest request)
     {
         var allKeys = await _minio.ListCvsAsync();
         var acceptedPaths = await _repository.GetAcceptedCvPathsAsync();
@@ -56,21 +54,45 @@ public sealed class FilteringService : IFilteringService
         if (toProcess.Count == 0)
             return new List<FilteringResultResponse>();
 
-        // ── Étape 1 : Index + Extract pour chaque CV ──────────────────────
-        var extractions = new Dictionary<string, (string MinioPath, ExtractionResponse Ext)>();
+        // ── Phase 1 : extraction texte (séquentielle — OCR non thread-safe) ───
+        var cvTexts = new Dictionary<string, string>(toProcess.Count);
 
         foreach (var cvKey in toProcess)
         {
             try
             {
-                var cvText = await ExtractCvTextAsync(cvKey);
+                cvTexts[cvKey] = await _cvExtractor.ExtractAsync(cvKey);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "[FilteringService] Extraction impossible pour {Key} — ignoré.", cvKey);
+            }
+        }
+
+        if (cvTexts.Count == 0)
+        {
+            _logger.LogWarning("[FilteringService] Aucun CV extractible.");
+            return new List<FilteringResultResponse>();
+        }
+
+        // ── Phase 2 : index + extract en parallèle (appels Python) ────────────
+        var extractions = new ConcurrentDictionary<string, (string MinioPath, ExtractionResponse Ext)>();
+        var semaphore = new SemaphoreSlim(MaxParallelPythonCalls);
+
+        var indexTasks = cvTexts.Select(async kvp =>
+        {
+            var (cvKey, cvText) = (kvp.Key, kvp.Value);
+            await semaphore.WaitAsync();
+            try
+            {
                 var indexResp = await _pythonApi.IndexAsync(new IndexRequest
                 {
                     CvText = cvText,
                     Metadata = new IndexMetadata { Filename = cvKey }
                 });
-                var extractResp = await _pythonApi.ExtractAsync(indexResp.CvId, cvText);
 
+                var extractResp = await _pythonApi.ExtractAsync(indexResp.CvId, cvText);
                 extractions[indexResp.CvId] = (cvKey, extractResp);
 
                 _logger.LogInformation(
@@ -80,52 +102,58 @@ public sealed class FilteringService : IFilteringService
             catch (Exception ex)
             {
                 _logger.LogError(ex,
-                    "[FilteringService] Erreur index/extract sur {Key} — ignoré.", cvKey);
+                    "[FilteringService] Erreur Python sur {Key} — ignoré.", cvKey);
             }
-        }
+            finally
+            {
+                semaphore.Release();
+            }
+        });
 
-        if (extractions.Count == 0)
+        await Task.WhenAll(indexTasks);
+
+        if (extractions.IsEmpty)
         {
             _logger.LogWarning("[FilteringService] Aucun CV indexé avec succès.");
             return new List<FilteringResultResponse>();
         }
 
-        // ── Étape 2 : Un seul appel /match ────────────────────────────────
-        var matchRequest = BuildMatchRequest(offer);
-        var matchResp = await _pythonApi.MatchAsync(matchRequest);
+        // ── Phase 3 : match global ─────────────────────────────────────────────
+        var matchResp = await _pythonApi.MatchAsync(BuildMatchRequest(request));
 
         _logger.LogInformation(
             "[FilteringService] /match terminé : {Count} candidats retournés.",
             matchResp.Candidates.Count);
 
-        // ── Étape 3 : Croisement + sauvegarde ─────────────────────────────
-        var results = new List<FilteringResultResponse>();
+        // ── Phase 4 : croisement + sauvegarde batch (fix N+1) ─────────────────
+        var toSave = new List<FilteringResult>();
+        var dtoData = new List<(FilteringResult Entity, ExtractionResponse Ext, CandidateMatch Match)>();
 
         foreach (var candidate in matchResp.Candidates)
         {
             if (!extractions.TryGetValue(candidate.CvId, out var entry))
             {
                 _logger.LogWarning(
-                    "[FilteringService] cv_id={Id} retourné par /match mais non trouvé localement.",
+                    "[FilteringService] cv_id={Id} retourné par /match mais non indexé localement.",
                     candidate.CvId);
                 continue;
             }
 
             var (minioPath, ext) = entry;
-            var result = BuildResult(candidate, ext, minioPath, offer.FilteringProfileId);
-
-            try
-            {
-                await _repository.AddAsync(result);
-                await _repository.SaveChangesAsync();
-                results.Add(FilteringResultMapper.ToDto(result, ext.Data, candidate));
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex,
-                    "[FilteringService] Erreur sauvegarde cv_id={Id}.", candidate.CvId);
-            }
+            var entity = BuildResult(candidate, ext, minioPath, request.FilteringProfileId);
+            toSave.Add(entity);
+            dtoData.Add((entity, ext, candidate));
         }
+
+        if (toSave.Count > 0)
+        {
+            await _repository.AddRangeAsync(toSave);
+            await _repository.SaveChangesAsync();
+        }
+
+        var results = dtoData
+            .Select(d => FilteringResultMapper.ToDto(d.Entity, d.Ext.Data, d.Match))
+            .ToList();
 
         _logger.LogInformation(
             "[FilteringService] Terminé : {Done}/{Total} CVs sauvegardés.",
@@ -139,6 +167,9 @@ public sealed class FilteringService : IFilteringService
         var results = await _repository.GetAllAsync();
         return FilteringResultMapper.ToDtoList(results);
     }
+
+    public async Task<string> GetCvPresignedUrlAsync(string fileName)
+        => await _minio.GetPresignedUrlAsync(fileName);
 
     // ── Actions RH ────────────────────────────────────────────────────────
     public async Task<AcceptCandidateResponse> AcceptCandidateAsync(
@@ -196,48 +227,22 @@ public sealed class FilteringService : IFilteringService
     }
 
     // ── Helpers privés ────────────────────────────────────────────────────
-
-    private async Task<string> ExtractCvTextAsync(string cvMinioPath)
-    {
-        var pdfBytes = await _minio.GetCvBytesAsync(cvMinioPath);
-
-        using var stream1 = new MemoryStream(pdfBytes);
-        var text = _pdfExtractor.ExtractText(stream1);
-
-        if (!string.IsNullOrWhiteSpace(text) && text.Length >= MinTextLength)
-            return text;
-
-        _logger.LogWarning(
-            "[FilteringService] PDF scanné ({Len} chars) → OCR : {Path}",
-            text.Length, cvMinioPath);
-
-        using var stream2 = new MemoryStream(pdfBytes);
-        text = _ocr.ExtractTextFromImages(stream2);
-
-        if (string.IsNullOrWhiteSpace(text) || text.Length < 20)
-            throw new InvalidOperationException($"CV illisible même après OCR : {cvMinioPath}");
-
-        return text;
-    }
-
-    private static MatchingRequest BuildMatchRequest(OfferForm offer) => new()
+    private static MatchingRequest BuildMatchRequest(AnalyzeCvsRequest r) => new()
     {
         JobOffer = new JobOfferDto
         {
-            JobTitle = offer.OfferTitle,
-            RequiredSkills = offer.TechSkills,
-            RequiredTools = offer.Tools,
-            RequiredExperienceYears = offer.MinExperience,
-            RequiredDegree = offer.Degree,
-            RequiredLanguages = string.IsNullOrEmpty(offer.Language)
+            JobTitle = r.OfferTitle,
+            RequiredSkills = r.TechSkills,
+            RequiredTools = r.Tools,
+            RequiredExperienceYears = r.MinExperience,
+            RequiredDegree = r.Degree,
+            RequiredLanguages = string.IsNullOrEmpty(r.Language)
                 ? new List<LangRequirement>()
                 : new List<LangRequirement>
-                {
-                    new() { Lang = offer.Language, Level = offer.LanguageLevel }
-                },
-            Location = offer.Location,
-            Certifications = offer.Certifications,
-            SoftSkills = offer.SoftSkills,
+                  { new() { Lang = r.Language, Level = r.LanguageLevel } },
+            Location = r.Location,
+            Certifications = r.Certifications,
+            SoftSkills = r.SoftSkills,
         },
         TopK = 20,
         SimilarityThreshold = 0.3,
@@ -245,16 +250,16 @@ public sealed class FilteringService : IFilteringService
     };
 
     private static FilteringResult BuildResult(
-    CandidateMatch candidate,
-    ExtractionResponse ext,
-    string minioPath,
-    int filteringProfileId)
+        CandidateMatch candidate,
+        ExtractionResponse ext,
+        string minioPath,
+        int filteringProfileId)
     {
         var data = ext.Data;
         var name = $"{data.PersonalInfo.FirstName} {data.PersonalInfo.LastName}".Trim();
         var techSkills = data.TechnicalSkills.Concat(data.Tools).Distinct();
 
-        return new FilteringResult
+        return new FilteringResult //hadchi khss ykon f mapper ta lmb3d 
         {
             CvId = candidate.CvId,
             CandidateName = string.IsNullOrWhiteSpace(name) ? candidate.Name : name,
@@ -266,7 +271,7 @@ public sealed class FilteringService : IFilteringService
             MainDomain = data.MainDomain,
             SeniorityLevel = data.SeniorityLevel,
             ExtractedSkills = string.Join(",", techSkills),
-            ExtractedSoftSkills = string.Join(",", data.SoftSkills),  // ← séparé
+            ExtractedSoftSkills = string.Join(",", data.SoftSkills),
             MissingSkills = string.Join(",", candidate.MissingSkills),
             Recommendation = candidate.Recommendation,
             ExperienceYears = data.TotalExperienceYears,
@@ -275,6 +280,7 @@ public sealed class FilteringService : IFilteringService
             FilteringProfileId = filteringProfileId == 0 ? null : filteringProfileId,
         };
     }
+
     private static string DetermineDecision(double score) => score switch
     {
         >= 80 => "Accepté",
